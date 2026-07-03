@@ -42,6 +42,18 @@ def main():
         for res in ex.map(lambda rs: segments_for(rs[0], rs[1], now), routes):
             obs.extend(res)
 
+    # Rotating CTB slice (per-stop API is heavy → a subset each cycle; covers all routes over ~hours).
+    try:
+        from harvest_stopwise import ctb_batch, ctb_segments
+        cyc = (hkt.hour * 60 + hkt.minute) // 10
+        batch = ctb_batch(cyc, size=15)
+        if batch:
+            ctb_obs = ctb_segments(batch, now)
+            obs.extend(ctb_obs)
+            print(f"CTB batch {len(batch)} routes → {len(ctb_obs)} obs")
+    except Exception as e:
+        print("CTB skip:", e)
+
     for o in obs:
         key = f"{o['co']}|{o['route']}|{o['st']}|{o['dir']}"
         seg = f"{o['a']}-{o['b']}"
