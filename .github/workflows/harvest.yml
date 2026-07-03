@@ -1,0 +1,30 @@
+name: harvest-eta
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: harvest
+  cancel-in-progress: false
+jobs:
+  cycle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Harvest one cycle
+        run: python gh_cycle.py
+      - name: Publish segment_times.json
+        run: |
+          git config user.name "departly-eta-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add segment_times.json
+          if git diff --cached --quiet; then echo "no change this cycle"; exit 0; fi
+          git commit -m "eta cycle $(date -u +%FT%TZ)"
+          git pull --rebase --autostash origin main || true
+          git push
