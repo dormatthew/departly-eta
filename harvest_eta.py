@@ -23,6 +23,7 @@ Usage:
 """
 import argparse, datetime, json, os, sys, time, urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from segdist import implausible
 
 BASE = "https://data.etabus.gov.hk/v1/transport/kmb"
 DATA = os.path.join(os.path.dirname(__file__), "data", "raw")
@@ -72,7 +73,10 @@ def segments_for(route, service_type, now_hint=None):
         run = [seqs[0]]
         runs = []
         for s in seqs[1:]:
-            if per[s] >= per[run[-1]] and (s == run[-1] + 1):     # contiguous + non-decreasing eta = same bus
+            prev = run[-1]
+            # contiguous + non-decreasing eta = same bus, UNLESS the implied speed is impossible
+            # (two vehicles' ETAs stitched across a long express gap → a run boundary, not a segment)
+            if (s == prev + 1) and (per[s] >= per[prev]) and not implausible(route, service_type, direction, prev, s, per[s] - per[prev]):
                 run.append(s)
             else:
                 if len(run) > 1: runs.append(run)

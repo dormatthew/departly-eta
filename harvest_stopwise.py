@@ -13,6 +13,7 @@ and its per-region route-id scheme is high-effort/low-yield here — revisit on 
 """
 import datetime, json, urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from segdist import implausible
 
 CTB = "https://rt.data.gov.hk/v2/transport/citybus"
 SCHEDULED = {"Scheduled Bus", "原定班次"}
@@ -44,7 +45,10 @@ def _chain(per, co, route, service, direction):
     if len(seqs) < 2: return out
     run = [seqs[0]]
     for s in seqs[1:]:
-        if per[s] >= per[run[-1]] and s == run[-1] + 1:
+        prev = run[-1]
+        # same bus only if contiguous, non-decreasing eta, AND not an impossible-speed stitch
+        # (seg_dist has no CTB distances yet → implausible() is a no-op; auto-activates once added)
+        if s == prev + 1 and per[s] >= per[prev] and not implausible(route, service, direction, prev, s, per[s] - per[prev]):
             run.append(s)
         else:
             if len(run) > 1: _emit(run, per, co, route, service, direction, out)
