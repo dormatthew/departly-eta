@@ -41,6 +41,10 @@ STATE = os.path.join(HERE, "segment_state.json")         # accumulator, release 
 REPO = os.environ.get("GITHUB_REPOSITORY", "dormatthew/departly-eta")
 STATE_TAG = "state"
 STATE_URL = f"https://github.com/{REPO}/releases/download/{STATE_TAG}/segment_state.json"
+# Two NEW derived datasets, published as release assets only. No shipped app reads them yet, so they
+# carry no format-compatibility constraint (unlike segment_times.json) and add zero git history.
+HEADWAYS = os.path.join(HERE, "headways.json")
+RAIL = os.path.join(HERE, "rail_times.json")
 
 LOOP_MINUTES = int(os.environ.get("LOOP_MINUTES", "50"))     # in-job budget (job cap is 6 h)
 CYCLE_EVERY_S = int(os.environ.get("CYCLE_EVERY_S", "600"))  # 10 min between cycle STARTS
@@ -70,37 +74,41 @@ def _load_json(path):
 def load_state():
     """Release asset -> local file -> the committed legacy file (bootstrap) -> empty.
 
-    Returns (data, meta). `data` is the legacy nested dict; `meta` carries publish bookkeeping.
+    Returns the whole state blob: `d` = the legacy segment estimates (and ONLY those — this is what
+    becomes segment_times.json, so nothing else may ever be mixed into it), `hwbus` / `rail` = the
+    newer derived layers, `meta` = publish bookkeeping.
     """
     # 1. the release asset (the real home)
     try:
         with urllib.request.urlopen(STATE_URL, timeout=60) as r:
             blob = json.loads(r.read().decode("utf-8"))
         if isinstance(blob, dict) and isinstance(blob.get("d"), dict):
-            print(f"state: release asset, {len(blob['d'])} keys")
-            return blob["d"], blob.get("meta", {})
+            print(f"state: release asset, {len(blob['d'])} segment keys, "
+                  f"{len(blob.get('hwbus', {}))} bus-headway keys")
+            return blob
     except Exception as e:
         print(f"state: no release asset ({e.__class__.__name__})")
 
     # 2. a local copy left by an earlier step in this same job
     blob = _load_json(STATE)
     if isinstance(blob, dict) and isinstance(blob.get("d"), dict):
-        print(f"state: local file, {len(blob['d'])} keys")
-        return blob["d"], blob.get("meta", {})
+        print(f"state: local file, {len(blob['d'])} segment keys")
+        return blob
 
     # 3. bootstrap from the committed published file (first run after this change)
     legacy = _load_json(FILE)
     if isinstance(legacy, dict) and legacy:
         print(f"state: bootstrapped from committed segment_times.json, {len(legacy)} keys")
-        return legacy, {}
+        return {"v": 1, "meta": {}, "d": legacy}
 
     print("state: cold start")
-    return {}, {}
+    return {"v": 1, "meta": {}, "d": {}}
 
 
-def save_state(data, meta):
+def save_state(blob):
+    blob["v"] = 1
     with open(STATE, "w") as fh:
-        json.dump({"v": 1, "meta": meta, "d": data}, fh, separators=(",", ":"), ensure_ascii=False)
+        json.dump(blob, fh, separators=(",", ":"), ensure_ascii=False)
 
 
 def publish_state():
@@ -119,7 +127,15 @@ def publish_state():
 
 # ---------------------------------------------------------------- one cycle
 
-def run_cycle(state, now):
+def _fold_hist(node, value, cap=121):
+    """Fold one observation into a 1-minute histogram. Histograms merge exactly across cycles with no
+    distributional assumption and no retained history — which is what lets p50/p90 be derived later,
+    and is why this is not an EMA like the segment estimates."""
+    hist = node.setdefault("h", [0] * cap)
+    hist[min(cap - 1, int(value))] += 1
+
+
+def run_cycle(blob, now):
     """Harvest one live cycle and fold it into `state`. Returns the observation count."""
     hkt = now.astimezone(datetime.timezone(datetime.timedelta(hours=8)))
     b = band(hkt.hour)
@@ -131,9 +147,31 @@ def run_cycle(state, now):
         return 0
 
     obs = []
+    hw = []                                        # observed successive-bus gaps, same payloads
     with ThreadPoolExecutor(max_workers=8) as ex:
-        for res in ex.map(lambda rs: segments_for(rs[0], rs[1], now), routes):
+        for res in ex.map(lambda rs: segments_for(rs[0], rs[1], now, _sink=hw), routes):
             obs.extend(res)
+
+    # BUS HEADWAYS — zero extra HTTP calls: they come out of the route-eta payloads already fetched
+    # above, whose eta_seq 2/3 rows this harvester used to discard. Aggregated at ROUTE-DIRECTION
+    # level (not per stop): per-stop is real, since bunching grows downstream, but costs ~3.4M numbers
+    # against 179k, and the median across a route's stops damps a single bunched stop without
+    # discarding the route.
+    for o in hw:
+        node = (blob.setdefault("hwbus", {})
+                     .setdefault(f"{o['co']}|{o['route']}|{o['st']}|{o['dir']}", {})
+                     .setdefault(dt, {}).setdefault(b, {}))
+        _fold_hist(node, o["gap"])
+
+    # RAIL — 188 GETs (~37 s measured). The only source of MTR/LRT headways and real first/last-train
+    # times in existence: TD's GTFS excludes rail and MTR publishes no timetable.
+    try:
+        import harvest_rail
+        rg, rm = harvest_rail.harvest()
+        harvest_rail.fold(blob.setdefault("rail", {}), rg, rm, hkt)
+        print(f"  rail: {len(rg)} gaps ({sum(1 for x in rg if x[2])} live), {len(rm)} departures")
+    except Exception as e:
+        print(f"  rail skip: {e.__class__.__name__}: {e}")
 
     # Rotating CTB slice (per-stop API is heavy → a subset each cycle; covers all routes over ~hours).
     try:
@@ -147,6 +185,9 @@ def run_cycle(state, now):
     except Exception as e:
         print("  CTB skip:", e)
 
+    # Segments fold into blob["d"] and NOWHERE ELSE: that dict is published verbatim as
+    # segment_times.json, which shipped apps parse, so a stray key here would corrupt every install.
+    state = blob.setdefault("d", {})
     for o in obs:
         key = f"{o['co']}|{o['route']}|{o['st']}|{o['dir']}"
         seg = f"{o['a']}-{o['b']}"
@@ -159,29 +200,95 @@ def run_cycle(state, now):
         else:
             node[seg] = [round(m, 1), 1]
 
-    print(f"  cycle {b}/{dt}: {len(obs)} obs / {len(routes)} routes")
+    print(f"  cycle {b}/{dt}: {len(obs)} obs / {len(routes)} routes, {len(hw)} headway gaps")
     return len(obs)
+
+
+def _summarize(hist):
+    """[mean, sd, p50, p90, n] from a 1-minute histogram."""
+    n = sum(hist)
+    if n == 0:
+        return None
+    mean = sum(i * c for i, c in enumerate(hist)) / n
+    var = sum(c * (i - mean) ** 2 for i, c in enumerate(hist)) / n
+    def pct(q):
+        want, run = q * n, 0
+        for i, c in enumerate(hist):
+            run += c
+            if run >= want:
+                return i
+        return len(hist) - 1
+    return [round(mean, 1), round(var ** 0.5, 1), pct(0.5), pct(0.9), n]
+
+
+def _upload(path):
+    if not os.environ.get("GITHUB_ACTIONS") or not os.path.exists(path):
+        return
+    subprocess.run(["gh", "release", "upload", STATE_TAG, path, "--clobber"], capture_output=True)
+
+
+def write_headways(blob, min_samples=5):
+    """Observed bus headways -> headways.json, as [mean, sd, p50, p90, n] per key/day-type/band.
+
+    Five numbers, not one, because the average wait for a rider arriving at random is NOT headway/2
+    when headways vary — the inspection paradox gives E[W] = (mean/2)(1 + cv^2). For a bunched route
+    with mean 14.8 and sd 7.2 that is 9.2 min, not 7.4: every `headway/2` in the engine systematically
+    FLATTERS unreliable routes, which is exactly the ranking dishonesty this dataset exists to fix.
+    """
+    out = {}
+    for key, bydt in blob.get("hwbus", {}).items():
+        dt_out = {}
+        for dt, byband in bydt.items():
+            b_out = {}
+            for b, node in byband.items():
+                s = _summarize(node.get("h", []))
+                if s and s[4] >= min_samples:
+                    b_out[b] = s
+            if b_out:
+                dt_out[dt] = b_out
+        if dt_out:
+            out[key] = dt_out
+    with open(HEADWAYS, "w") as fh:
+        json.dump({"v": 1, "generated": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                   "d": out}, fh, separators=(",", ":"))
+    print(f"headways.json: {len(out)} route-dirs (n>={min_samples})")
+    _upload(HEADWAYS)
+
+
+def write_rail(blob):
+    try:
+        import harvest_rail
+        out = harvest_rail.publish(blob.get("rail", {}))
+    except Exception as e:
+        print(f"rail publish skip: {e.__class__.__name__}: {e}")
+        return
+    with open(RAIL, "w") as fh:
+        json.dump({**out, "generated": datetime.datetime.now(datetime.timezone.utc).isoformat()},
+                  fh, separators=(",", ":"))
+    print(f"rail_times.json: {len(out.get('hw', {}))} headway keys, {len(out.get('svc', {}))} windows")
+    _upload(RAIL)
 
 
 # ---------------------------------------------------------------- main
 
 def main():
-    state, meta = load_state()
+    blob = load_state()
+    meta = blob.setdefault("meta", {})
     deadline = time.monotonic() + LOOP_MINUTES * 60
     cycles = total_obs = 0
 
     while True:
         cycle_start = time.monotonic()
         try:
-            total_obs += run_cycle(state, datetime.datetime.now(datetime.timezone.utc))
+            total_obs += run_cycle(blob, datetime.datetime.now(datetime.timezone.utc))
             cycles += 1
         except Exception as e:                     # one bad cycle must not lose the whole run
             print(f"  cycle failed: {e.__class__.__name__}: {e}")
 
         # Checkpoint after EVERY cycle, to the release asset as well as locally. This is what makes
         # `cancel-in-progress: true` safe: a run killed mid-loop loses at most the cycle in flight,
-        # not the whole 50 minutes. A ~4 MB upload every 10 min is negligible.
-        save_state(state, meta)
+        # not the whole loop.
+        save_state(blob)
         publish_state()
 
         nxt = cycle_start + CYCLE_EVERY_S
@@ -191,11 +298,18 @@ def main():
         if remaining > 0:
             time.sleep(remaining)
 
+    state = blob.get("d", {})
     segs = sum(len(bb) for v in state.values() for dd in v.values() for bb in dd.values())
     trusted = sum(1 for v in state.values() for dd in v.values() for bb in dd.values()
                   for val in bb.values() if val[1] >= 3)
     print(f"{cycles} cycles, {total_obs} obs → {len(state)} keys / {segs} segments "
           f"({trusted} trusted, n≥3)")
+
+    # ---- derived datasets: published EVERY run as release assets ---------------------
+    # These are new, so no shipped app reads them and there is no format-compatibility constraint;
+    # being release assets they also add zero git history, so they can refresh as often as we like.
+    write_headways(blob)
+    write_rail(blob)
 
     # ---- publish the legacy file only every PUBLISH_EVERY_H hours -------------------
     now = datetime.datetime.now(datetime.timezone.utc)
@@ -211,12 +325,13 @@ def main():
             pass
 
     if due:
-        # EXACT legacy shape — see the module docstring. Do not reformat.
+        # EXACT legacy shape, and blob["d"] ONLY — see the module docstring. Do not reformat, and
+        # never serialise the whole blob here: the newer layers must not reach shipped parsers.
         with open(FILE, "w") as fh:
             json.dump(state, fh, separators=(",", ":"), ensure_ascii=False)
         meta["last_publish"] = now.isoformat()
         print(f"published segment_times.json ({os.path.getsize(FILE)//1024} KB)")
-        save_state(state, meta)      # persist the new last_publish so the next run gates correctly
+        save_state(blob)             # persist the new last_publish so the next run gates correctly
         publish_state()
     else:
         print("segment_times.json left untouched this run")

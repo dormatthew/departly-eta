@@ -3,3 +3,6 @@ data/
 # The harvest accumulator lives in the `state` release asset, never in git — committing it is what
 # grew this repo to 176 MB in 30 days. See gh_cycle.py.
 segment_state.json
+# Derived layers, also published as release assets rather than committed.
+headways.json
+rail_times.json
