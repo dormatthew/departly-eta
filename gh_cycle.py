@@ -285,11 +285,17 @@ def main():
         except Exception as e:                     # one bad cycle must not lose the whole run
             print(f"  cycle failed: {e.__class__.__name__}: {e}")
 
-        # Checkpoint after EVERY cycle, to the release asset as well as locally. This is what makes
+        # Checkpoint after EVERY cycle, to the release assets as well as locally. This is what makes
         # `cancel-in-progress: true` safe: a run killed mid-loop loses at most the cycle in flight,
         # not the whole loop.
+        #
+        # The DERIVED datasets are refreshed here too, not just at the end of main(). Runs are routinely
+        # cancelled by the next scheduled trigger before the loop finishes, so anything published only
+        # after the loop would almost never ship. Both are small and cheap to recompute.
         save_state(blob)
         publish_state()
+        write_headways(blob)
+        write_rail(blob)
 
         nxt = cycle_start + CYCLE_EVERY_S
         if nxt >= deadline:
@@ -304,12 +310,6 @@ def main():
                   for val in bb.values() if val[1] >= 3)
     print(f"{cycles} cycles, {total_obs} obs → {len(state)} keys / {segs} segments "
           f"({trusted} trusted, n≥3)")
-
-    # ---- derived datasets: published EVERY run as release assets ---------------------
-    # These are new, so no shipped app reads them and there is no format-compatibility constraint;
-    # being release assets they also add zero git history, so they can refresh as often as we like.
-    write_headways(blob)
-    write_rail(blob)
 
     # ---- publish the legacy file only every PUBLISH_EVERY_H hours -------------------
     now = datetime.datetime.now(datetime.timezone.utc)
