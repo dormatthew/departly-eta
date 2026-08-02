@@ -1,0 +1,47 @@
+name: harvest-eta
+on:
+  schedule:
+    # Aspirational only. Measured over 200 runs (2026-07-19 → 08-02), GitHub actually fires this
+    # 13–17 times a day on a free public repo, i.e. roughly every 100 minutes. That is why the job
+    # LOOPS internally rather than doing one cycle and exiting — see gh_cycle.py.
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: harvest
+  # A fresh trigger should replace a stale long-running loop, not queue behind it. Safe because
+  # gh_cycle.py checkpoints state to the release asset after EVERY cycle, so a cancelled run
+  # loses at most the cycle in flight.
+  cancel-in-progress: true
+jobs:
+  cycle:
+    runs-on: ubuntu-latest
+    # GitHub's job cap is 6 h; the old 8-minute limit was self-imposed and capped coverage at ~3%
+    # of wall-clock. 55 gives the 50-minute loop headroom to finish and publish.
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Harvest cycles
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # for `gh release upload` of the state asset
+          # Must comfortably finish BEFORE the next trigger cancels this run, or the publish step at the
+          # end of the job is never reached and segment_times.json would go stale for ever. Observed
+          # trigger gaps are 61-75 min, so 40 leaves real margin. (State itself is safe either way — it
+          # is checkpointed to the release asset after every cycle.)
+          LOOP_MINUTES: "40"
+          CYCLE_EVERY_S: "600"                    # never poll faster than the cron always intended
+          PUBLISH_EVERY_H: "12"
+        run: python gh_cycle.py
+      - name: Publish segment_times.json
+        run: |
+          git config user.name "departly-eta-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add segment_times.json
+          if git diff --cached --quiet; then echo "not due for publish — nothing to commit"; exit 0; fi
+          git commit -m "eta publish $(date -u +%FT%TZ)"
+          git pull --rebase --autostash origin main || true
+          git push
