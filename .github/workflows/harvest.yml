@@ -28,7 +28,11 @@ jobs:
       - name: Harvest cycles
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # for `gh release upload` of the state asset
-          LOOP_MINUTES: "50"
+          # Must comfortably finish BEFORE the next trigger cancels this run, or the publish step at the
+          # end of the job is never reached and segment_times.json would go stale for ever. Observed
+          # trigger gaps are 61-75 min, so 40 leaves real margin. (State itself is safe either way — it
+          # is checkpointed to the release asset after every cycle.)
+          LOOP_MINUTES: "40"
           CYCLE_EVERY_S: "600"                    # never poll faster than the cron always intended
           PUBLISH_EVERY_H: "12"
         run: python gh_cycle.py
