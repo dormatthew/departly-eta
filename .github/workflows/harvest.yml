@@ -36,6 +36,18 @@ jobs:
           CYCLE_EVERY_S: "600"                    # never poll faster than the cron always intended
           PUBLISH_EVERY_H: "12"
         run: python gh_cycle.py
+      # KEEPS THE SCHEDULE ALIVE, as a side effect of doing real work.
+      #
+      # GitHub's docs: "In a public repository, scheduled workflows are automatically disabled when no
+      # repository activity has occurred in 60 days." GitHub never defines "activity", and the commit
+      # below is the only thing here that plausibly resets that clock -- but it is CONDITIONAL: it is
+      # skipped both when the 12-hour publish window has not elapsed and when the content is unchanged.
+      # A long enough quiet stretch with no human push would therefore disable the workflow silently.
+      #
+      # Traffic medians move constantly so a 60-day freeze is implausible in practice, and this is NOT
+      # defended with a dummy-commit keepalive: that is the exact pattern GitHub has enforced against
+      # (the most popular keepalive action is ToS-blocked). Instead the freshness of this file is
+      # visible on the repo home page, and `workflow_dispatch` remains available to restart it by hand.
       - name: Publish segment_times.json
         run: |
           git config user.name "departly-eta-bot"
